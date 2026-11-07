@@ -1,0 +1,24 @@
+{
+  "name": "@astro-survey-atlas/sky-globe",
+  "version": "0.1.0",
+  "description": "three.js HEALPix coverage globe shared by Astro Survey Atlas Assets and Workspace",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": [
+    "*.css"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./theme.css": "./theme.css"
+  },
+  "files": [
+    "src",
+    "theme.css"
+  ],
+  "dependencies": {
+    "healpixjs": "^2.0.0"
+  },
+  "peerDependencies": {
+    "three": ">=0.185.0 <0.186.0"
+  }
+}

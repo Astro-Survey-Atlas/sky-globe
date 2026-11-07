@@ -1,0 +1,63 @@
+/* Tactical HUD design tokens shared by Astro Survey Atlas Assets and Workspace.
+   One language, two palettes: the dark theme is a glowing tactical display,
+   the light theme reuses the same geometry on frosted paper without glow.
+   Brand colours come from the logo: indigo #2c3792 and magenta #f01951.
+   Select a palette with <html data-theme="dark|light">; dark is the default. */
+:root,
+:root[data-theme="dark"] {
+  --hud-bg: #010104;
+  --hud-bg-image: radial-gradient(ellipse at 50% 40%, #07071a 0%, #010104 70%);
+  --hud-ink: #f2f2ff;
+  --hud-dim: #8d90b8;
+  --hud-faint: #4a4d72;
+  --hud-line: rgba(160, 168, 255, .2);
+  --hud-line-strong: rgba(160, 168, 255, .45);
+  --hud-ind: #8592ff;
+  --hud-ind-soft: rgba(133, 146, 255, .16);
+  --hud-hot: #ff2e63;
+  --hud-hot-soft: rgba(255, 46, 99, .16);
+  --hud-plate: linear-gradient(90deg, rgba(8, 8, 22, .86), rgba(8, 8, 22, .58));
+  --hud-plate-solid: rgba(6, 6, 18, .9);
+  --hud-plate-base: rgba(6, 6, 18, .2);
+  --hud-head: linear-gradient(90deg, rgba(44, 55, 146, .6), rgba(44, 55, 146, 0));
+  --hud-head-hot: linear-gradient(90deg, rgba(240, 25, 81, .55), rgba(240, 25, 81, 0));
+  --hud-blur: blur(8px) saturate(1.2);
+  --hud-ind-glow: 0 0 14px rgba(133, 146, 255, .55);
+  --hud-hot-glow: 0 0 14px rgba(255, 46, 99, .8);
+  --hud-text-glow: 0 0 10px rgba(200, 205, 255, .45);
+  --hud-hot-text-glow: 0 0 12px rgba(255, 46, 99, .85);
+  --hud-shadow: 0 18px 40px rgba(0, 0, 0, .45);
+  --hud-chamfer: 10px;
+  --font-hud: "Atlas Mono", "Atlas Sans CJK", monospace;
+  --hud-ring-hot: var(--hud-hot);
+  --hud-ring-track: var(--hud-line);
+  --hud-ring-glow: drop-shadow(0 0 3px color-mix(in srgb, var(--hud-hot) 55%, transparent));
+}
+
+:root[data-theme="light"] {
+  --hud-bg: #e9ebf3;
+  --hud-bg-image: radial-gradient(ellipse at 50% 40%, #f7f8fc 0%, #e4e7f1 75%);
+  --hud-ink: #15162e;
+  --hud-dim: #585b80;
+  --hud-faint: #a0a3c0;
+  --hud-line: rgba(44, 55, 146, .16);
+  --hud-line-strong: rgba(44, 55, 146, .42);
+  --hud-ind: #2c3792;
+  --hud-ind-soft: rgba(44, 55, 146, .09);
+  --hud-hot: #e0124b;
+  --hud-hot-soft: rgba(224, 18, 75, .09);
+  --hud-plate: linear-gradient(90deg, rgba(255, 255, 255, .82), rgba(255, 255, 255, .5));
+  --hud-plate-solid: rgba(255, 255, 255, .88);
+  --hud-plate-base: rgba(255, 255, 255, .2);
+  --hud-head: linear-gradient(90deg, rgba(44, 55, 146, .13), rgba(44, 55, 146, 0));
+  --hud-head-hot: linear-gradient(90deg, rgba(240, 25, 81, .14), rgba(240, 25, 81, 0));
+  --hud-blur: blur(22px) saturate(1.5);
+  --hud-ind-glow: 0 0 0 transparent;
+  --hud-hot-glow: 0 0 0 transparent;
+  --hud-text-glow: none;
+  --hud-hot-text-glow: none;
+  --hud-shadow: 0 18px 40px rgba(40, 44, 90, .12);
+  --hud-ring-hot: var(--hud-hot);
+  --hud-ring-track: var(--hud-line);
+  --hud-ring-glow: none;
+}
