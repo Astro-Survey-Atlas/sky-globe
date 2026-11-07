@@ -94,12 +94,26 @@ export interface SurveyLayerContextMenu {
   surveyIds: string[];
   releaseIds?: string[];
   assetIds: string[];
+  /** Overlap component under the pointer, when `overlapContextMenu` is enabled. */
+  componentId?: string;
+  /** Public source ids of the covered footprints, when `sourceIdForFootprint` is set. */
+  sourceIds?: string[];
 }
 
 export interface SurveyLayerOverlapComponent {
   id: string;
   order: number;
   cells: number[];
+  sourceIds?: string[];
+  areaDeg2?: number;
+}
+
+/** Optional behaviour. Every option defaults to the Assets public-site behaviour. */
+export interface SurveyLayerViewerOptions {
+  /** Map a footprint to a stable public source id reported in context menus. */
+  sourceIdForFootprint?: (footprint: SurveyFootprint) => string | null | undefined;
+  /** Open the context menu in overlap mode, scoped to the component under the pointer. */
+  overlapContextMenu?: boolean;
 }
 
 export interface SurveyLayerOverlapCoverage {
@@ -121,18 +135,26 @@ export function recenteredOrbitPose(
 }
 
 export interface WorkspaceCoverageLayer {
+  /** Explicit key. Keys starting with `moc:` get their own visibility toggle
+   * (`setVisibleWorkspaceLayerKeys`) instead of following asset visibility. */
   key?: string;
+  layerId?: string;
   assetId?: string;
   assetIds?: string[];
   assetName?: string;
   status?: string;
   surveyId?: string;
   releaseId?: string;
-  source?: "connector" | "asset" | "unassigned" | "conflict";
+  productId?: string;
+  modality?: string;
+  artifactId?: string;
+  source?: "connector" | "asset" | "combined" | "unassigned" | "conflict";
   message?: string;
   color?: string;
   nside: number;
   pixels: number[];
+  /** Drawn and inspectable, but not offered as available data. */
+  preview?: boolean;
 }
 
 export interface WorkspaceCoverageMembership {
@@ -143,6 +165,8 @@ export interface WorkspaceCoverageMembership {
   status?: string;
   surveyId?: string;
   releaseId?: string;
+  productId?: string;
+  modality?: string;
   source?: WorkspaceCoverageLayer["source"];
   message?: string;
 }
@@ -211,6 +235,9 @@ export interface SurveyLayerState {
   } | null;
   visibleSurveyIds: string[];
   visibleAssetIds: string[];
+  visibleWorkspaceLayerKeys: string[];
+  explodedPixel: number | null;
+  explodedLayerCount: number;
   layerOrder: string[];
   layerDepths: LayerDepth[];
   layoutMode: SurveyLayerLayoutMode;
@@ -329,6 +356,8 @@ const DIMMED_OPACITY = 0.2;
 const DIMMED_EDGE_OPACITY = 0.1;
 const EXPLODED_OPACITY = 0.58;
 const EXPLODED_LAYER_STEP = 0.18;
+/** The innermost exploded sheet never collapses through the sphere centre. */
+const MINIMUM_EXPLODED_RADIUS = 0.05;
 const DRILL_RENDER_ORDER = 10_000;
 const EXPLOSION_RENDER_ORDER = 11_000;
 const SELECTION_RENDER_ORDER = 12_000;
@@ -615,11 +644,13 @@ export class SurveyLayerViewer {
   readonly #onContextMenu: (menu: SurveyLayerContextMenu) => void;
   readonly #onObjectPoint?: (point: SurveyObjectPoint) => void;
   readonly #onOverlapComponent?: OverlapComponentChange;
+  readonly #options: SurveyLayerViewerOptions;
   #model: SurveyLayerModel;
   readonly #colorBySurvey = new Map<string, THREE.Color>();
   readonly #selectedPixels = new Set<number>();
   readonly #visibleSurveyIds = new Set<string>();
   readonly #visibleAssetIds = new Set<string>();
+  readonly #visibleWorkspaceLayerKeys = new Set<string>();
   readonly #layerMeshes: LayerMesh[] = [];
   readonly #coverageEdgeMaterials: THREE.LineBasicMaterial[] = [];
   readonly #coverageSourceMaterials: THREE.MeshBasicMaterial[] = [];
@@ -672,6 +703,7 @@ export class SurveyLayerViewer {
     onStateChange: (state: SurveyLayerState) => void,
     onObjectPoint?: (point: SurveyObjectPoint) => void,
     onOverlapComponent?: OverlapComponentChange,
+    options: SurveyLayerViewerOptions = {},
   ) {
     this.#canvas = canvas;
     this.#manifest = manifest;
@@ -682,6 +714,7 @@ export class SurveyLayerViewer {
     this.#onStateChange = onStateChange;
     this.#onObjectPoint = onObjectPoint;
     this.#onOverlapComponent = onOverlapComponent;
+    this.#options = options;
     this.#model = buildSurveyLayerModel(surveys, manifest);
     surveys.forEach((survey) => this.#colorBySurvey.set(survey.id, new THREE.Color(surveyColorFor(survey.id, survey.color))));
 
@@ -980,6 +1013,9 @@ export class SurveyLayerViewer {
       selectionAnchor: this.#selectionAnchor(),
       visibleSurveyIds: [...this.#visibleSurveyIds],
       visibleAssetIds: [...this.#visibleAssetIds],
+      visibleWorkspaceLayerKeys: [...this.#visibleWorkspaceLayerKeys],
+      explodedPixel: this.#explodedPixel,
+      explodedLayerCount: this.#explodedPixel == null ? 0 : this.#explodedFragments.length,
       layerOrder: this.#normalizedLayerOrder(),
       layerDepths: this.#displayDepths(),
       layoutMode: this.#layoutMode,
@@ -1260,7 +1296,7 @@ export class SurveyLayerViewer {
     const radii = this.#displayDepths().map((entry) => entry.radius);
     const explodedOuter = this.#explodedPixel == null
       ? 1
-      : 1 + Math.max(0, this.#explodedFragments.length - 1) * EXPLODED_LAYER_STEP / 2;
+      : Math.max(1, ...this.#explodedFragments.map((fragment) => fragment.root.userData.targetRadius ?? 1));
     return Math.max(1, explodedOuter, ...radii);
   }
 
@@ -1402,6 +1438,22 @@ export class SurveyLayerViewer {
     this.#pruneSelection();
     this.#rebuildVisible(true);
   }
+  setVisibleWorkspaceLayerKeys(keys: Iterable<string>): void {
+    const next = new Set([...keys].filter((key) => typeof key === "string" && key.length > 0));
+    if (next.size === this.#visibleWorkspaceLayerKeys.size && [...next].every((key) => this.#visibleWorkspaceLayerKeys.has(key))) return;
+    this.#visibleWorkspaceLayerKeys.clear();
+    next.forEach((key) => this.#visibleWorkspaceLayerKeys.add(key));
+    this.#pruneSelection();
+    this.#rebuildVisible(true);
+  }
+
+  /** Fly to an overlap component of the current overlap view. */
+  focusOverlapComponent(componentId: string): void {
+    const component = this.#overlapComponents.find((candidate) => candidate.id === componentId);
+    if (!component || !this.#overlapMode) return;
+    this.focusPixels(2 ** component.order, component.cells);
+  }
+
 
   setLayerOrder(keys: Iterable<string>): void {
     const next = normalizeLayerOrder(this.#knownLayerKeys(), keys, []);
@@ -1833,6 +1885,10 @@ export class SurveyLayerViewer {
   }
 
   #workspaceLayerVisible(layer: WorkspaceCoverageLayer): boolean {
+    const key = this.#workspaceLayerKey(layer);
+    // Explicit MOC layers have their own visibility toggle even when the
+    // coverage payload records the source asset as well.
+    if (key.startsWith("moc:")) return this.#visibleWorkspaceLayerKeys.has(key);
     const assetIds = this.#workspaceLayerAssetIds(layer);
     if (assetIds.length) return assetIds.some((assetId) => this.#visibleAssetIds.has(assetId));
     return this.#visibleSurveyIds.has(layer.surveyId ?? "__unassigned__");
@@ -1843,9 +1899,13 @@ export class SurveyLayerViewer {
   }
 
   #workspaceLayerKey(layer: WorkspaceCoverageLayer): string {
+    if (layer.key?.startsWith("moc:")) return layer.key;
     const assetId = this.#workspaceLayerAssetIds(layer)[0];
     if (assetId) return `asset:${assetId}`;
-    if (layer.surveyId) return `public-survey:${layer.surveyId}`;
+    if (layer.artifactId) return `moc:${layer.artifactId}`;
+    if (layer.key) return layer.key;
+    if (layer.layerId) return `workspace:${layer.layerId}`;
+    if (layer.surveyId) return `workspace:${layer.surveyId}`;
     return "workspace-unassigned";
   }
 
@@ -1928,6 +1988,10 @@ export class SurveyLayerViewer {
   }
 
   #workspaceAvailableAt(pixel: number): boolean {
+    return [...this.#workspaceLayers.values()].some((layer) => !layer.preview && this.#workspaceLayerVisible(layer) && layer.pixels.includes(pixel));
+  }
+
+  #workspaceInteractiveAt(pixel: number): boolean {
     return [...this.#workspaceLayers.values()].some((layer) => this.#workspaceLayerVisible(layer) && layer.pixels.includes(pixel));
   }
 
@@ -1947,6 +2011,8 @@ export class SurveyLayerViewer {
           status: layer.status,
           surveyId: layer.surveyId,
           releaseId: layer.releaseId,
+          productId: layer.productId,
+          modality: layer.modality,
           source: layer.source,
           message: layer.message,
         };
@@ -2094,7 +2160,7 @@ export class SurveyLayerViewer {
     this.#requestRender();
   }
 
-  #pickCell(event: PointerCoordinates): { pixel: number; nside: number; membership: CoverageCellMembership | null; workspaceAvailable: boolean; point: THREE.Vector3 } | null {
+  #pickCell(event: PointerCoordinates): { pixel: number; nside: number; membership: CoverageCellMembership | null; workspaceAvailable: boolean; workspaceInteractive: boolean; point: THREE.Vector3 } | null {
     const bounds = this.#canvas.getBoundingClientRect();
     if (bounds.width <= 0 || bounds.height <= 0) return null;
     this.#pointer.set(((event.clientX - bounds.left) / bounds.width) * 2 - 1, -((event.clientY - bounds.top) / bounds.height) * 2 + 1);
@@ -2124,7 +2190,7 @@ export class SurveyLayerViewer {
       const membership = this.#overlapNside === this.#manifest.nside
         ? visibleCoverageAtPixel(this.#model, pixel, this.#visibleSurveyIds)
         : null;
-      return { pixel, nside: this.#overlapNside, membership, workspaceAvailable: false, point };
+      return { pixel, nside: this.#overlapNside, membership, workspaceAvailable: false, workspaceInteractive: false, point };
     }
     if (!unitPoint && !renderedHit) return null;
     const point = unitPoint ?? renderedHit!.point.clone().normalize();
@@ -2132,9 +2198,49 @@ export class SurveyLayerViewer {
     const pixel = renderedPixel ?? healpixPixelFromSceneDirection(nside, point);
     const membership = nside === this.#manifest.nside ? visibleCoverageAtPixel(this.#model, pixel, this.#visibleSurveyIds) : null;
     const workspaceAvailable = nside === this.#manifest.nside && this.#workspaceAvailableAt(pixel);
+    const workspaceInteractive = nside === this.#manifest.nside && this.#workspaceInteractiveAt(pixel);
     const drillAvailable = nside === this.#drillNside && this.#drillCells.has(pixel);
-    if (!membership && !workspaceAvailable && !drillAvailable && this.#interactionMode !== "region") return null;
-    return { pixel, nside, membership, workspaceAvailable: workspaceAvailable || drillAvailable, point };
+    if (!membership && !workspaceInteractive && !drillAvailable && this.#interactionMode !== "region") {
+      // A layer drawn off the unit sphere can sit under the pointer while the
+      // unit-sphere ray lands in an uncovered neighbour; fall back to the shell.
+      const shell = this.#pickShellCell();
+      if (!shell) return null;
+      const shellMembership = shell.nside === this.#manifest.nside ? visibleCoverageAtPixel(this.#model, shell.pixel, this.#visibleSurveyIds) : null;
+      const shellAvailable = shell.nside === this.#manifest.nside && this.#workspaceAvailableAt(shell.pixel);
+      const shellInteractive = shell.nside === this.#manifest.nside && this.#workspaceInteractiveAt(shell.pixel);
+      if (!shellMembership && !shellInteractive) return null;
+      return { ...shell, membership: shellMembership, workspaceAvailable: shellAvailable, workspaceInteractive: shellInteractive };
+    }
+    return { pixel, nside, membership, workspaceAvailable: workspaceAvailable || drillAvailable, workspaceInteractive: workspaceInteractive || drillAvailable, point };
+  }
+
+  /** Nearest drawn coverage cell under the current ray, intersected at each layer's own radius. */
+  #pickShellCell(): { pixel: number; nside: number; point: THREE.Vector3 } | null {
+    this.#scene.updateMatrixWorld(true);
+    let best: { pixel: number; nside: number; point: THREE.Vector3 } | null = null;
+    let nearest = Infinity;
+    const vertex = new THREE.Vector3();
+    for (const group of [this.#workspaceCoverageGroup, this.#coverageGroup]) {
+      group.traverse((object) => {
+        const mesh = object as Partial<LayerMesh> & THREE.Object3D;
+        const records = mesh.userData?.records;
+        if (!(object instanceof THREE.Mesh) || !object.visible || !records?.length || mesh.userData?.drill) return;
+        const position = object.geometry.getAttribute("position");
+        if (!position?.count) return;
+        const radius = vertex.fromBufferAttribute(position, 0).applyMatrix4(object.matrixWorld).length();
+        const point = this.#intersectSphere(this.#raycaster.ray, radius);
+        if (!point) return;
+        const distance = point.distanceTo(this.#raycaster.ray.origin);
+        if (distance >= nearest) return;
+        const layerKey = mesh.userData?.layerKey;
+        const nside = layerKey ? [...this.#workspaceLayers.values()].find((layer) => layer.key === layerKey)?.nside ?? this.#manifest.nside : this.#manifest.nside;
+        const pixel = healpixPixelFromSceneDirection(nside, point);
+        if (!records.some((record) => record.pixel === pixel)) return;
+        best = { pixel, nside, point: point.normalize() };
+        nearest = distance;
+      });
+    }
+    return best;
   }
 
   #pickObject(event: PointerCoordinates): SurveyObjectPoint | null {
@@ -2156,12 +2262,16 @@ export class SurveyLayerViewer {
   }
 
   #intersectUnitSphere(ray: THREE.Ray): THREE.Vector3 | null {
+    return this.#intersectSphere(ray, 1);
+  }
+
+  #intersectSphere(ray: THREE.Ray, radius: number): THREE.Vector3 | null {
     const origin = ray.origin;
     const direction = ray.direction;
     const a = direction.lengthSq();
     if (a === 0) return null;
     const b = 2 * origin.dot(direction);
-    const c = origin.lengthSq() - 1;
+    const c = origin.lengthSq() - radius * radius;
     const discriminant = b * b - 4 * a * c;
     if (discriminant < 0) return null;
     const sqrt = Math.sqrt(discriminant);
@@ -2174,7 +2284,7 @@ export class SurveyLayerViewer {
 
   #inspect(event: PointerCoordinates): void {
     const hit = this.#pickCell(event);
-    if (!hit?.membership && !hit?.workspaceAvailable) {
+    if (!hit?.membership && !hit?.workspaceInteractive) {
       this.#clearExplosion(true);
       this.#onInspection(null);
       this.#emitState();
@@ -2411,7 +2521,7 @@ export class SurveyLayerViewer {
     for (const surveyId of membership.surveyIds) {
       if (!this.#visibleSurveyIds.has(surveyId)) continue;
       entries.push({
-        key: `survey:${surveyId}`,
+        key: `public-survey:${surveyId}`,
         nside,
         pixel,
         color: this.#surveyColor(surveyId),
@@ -2420,7 +2530,7 @@ export class SurveyLayerViewer {
     }
     if (nside === this.#manifest.nside) {
       this.#workspaceDisplayLayers(depths)
-        .filter(({ layer }) => layer.pixels.includes(pixel))
+        .filter(({ layer }) => !layer.preview && layer.pixels.includes(pixel))
         .forEach(({ layer, radius, color }) => entries.push({
           key: layer.key ?? layer.assetId ?? layer.surveyId ?? "workspace",
           nside,
@@ -2442,9 +2552,15 @@ export class SurveyLayerViewer {
         existingKeys.add(key);
       }
     }
+    // Fan out in display order: the first layer in the order is outermost,
+    // as it is on the globe itself.
+    const order = this.#normalizedLayerOrder();
+    const rank = (key: string) => { const index = order.indexOf(key); return index < 0 ? order.length : index; };
+    entries.sort((left, right) => rank(left.key) - rank(right.key));
     const midpoint = (entries.length - 1) / 2;
+    const step = Math.min(EXPLODED_LAYER_STEP, (1 - MINIMUM_EXPLODED_RADIUS) / Math.max(1, midpoint));
     this.#explodedFragments = entries.map((entry, index) => {
-      const targetRadius = 1 + (index - midpoint) * EXPLODED_LAYER_STEP;
+      const targetRadius = 1 + (midpoint - index) * step;
       const root = new THREE.Group();
       root.scale.setScalar(entry.sourceRadius / targetRadius);
       root.userData.sourceRadius = entry.sourceRadius;
@@ -2459,6 +2575,7 @@ export class SurveyLayerViewer {
       const material = fragmentMaterial(0);
       const mesh = new THREE.Mesh(buildSphericalCellSheetGeometry([cell]), material);
       mesh.renderOrder = EXPLOSION_RENDER_ORDER + index * 2;
+      mesh.userData = { layerKey: entry.key };
       const lineMaterial = new THREE.LineBasicMaterial({
         vertexColors: true,
         transparent: true,
@@ -2780,7 +2897,7 @@ export class SurveyLayerViewer {
   readonly #handlePointerCancel = (): void => { this.#pointerStart = null; };
   readonly #handleContextMenu = (event: MouseEvent): void => {
     event.preventDefault();
-    if (this.#overlapMode) return;
+    if (this.#overlapMode && !this.#options.overlapContextMenu) return;
     const hit = this.#pickCell(event);
     if (!hit || hit.nside !== this.#manifest.nside) {
       this.#onHover(null);
@@ -2792,12 +2909,16 @@ export class SurveyLayerViewer {
       this.#renderSelectionRegion();
       this.#emitSelection();
     }
+    const overlapComponent = this.#overlapMode ? this.#pickOverlapComponent(event) : null;
+    const sourceIdFor = this.#options.sourceIdForFootprint;
     const surveyIds = new Set<string>();
     const releaseIds = new Set<string>();
     const assetIds = new Set<string>();
-    for (const pixel of this.#selectedPixels) {
+    const sourceIds = new Set<string>();
+    for (const pixel of overlapComponent?.cells ?? this.#selectedPixels) {
       const membership = visibleCoverageAtPixel(this.#model, pixel, this.#visibleSurveyIds);
       const workspace = this.#workspaceMembershipAt(pixel);
+      if (sourceIdFor) membership?.artifacts.forEach((artifact) => { const id = sourceIdFor(artifact); if (id) sourceIds.add(id); });
       membership?.surveyIds.forEach((surveyId) => surveyIds.add(surveyId));
       membership?.releaseIds.forEach((releaseId) => releaseIds.add(releaseId));
       workspace.surveyIds.forEach((surveyId) => surveyIds.add(surveyId));
@@ -2807,11 +2928,13 @@ export class SurveyLayerViewer {
     this.#onContextMenu({
       clientX: event.clientX,
       clientY: event.clientY,
-      nside: this.#manifest.nside,
-      pixels: [...this.#selectedPixels].sort((left, right) => left - right),
+      nside: overlapComponent ? 2 ** overlapComponent.order : this.#manifest.nside,
+      pixels: overlapComponent ? [...overlapComponent.cells] : [...this.#selectedPixels].sort((left, right) => left - right),
       surveyIds: [...surveyIds].sort(),
       releaseIds: [...releaseIds].sort(),
       assetIds: [...assetIds].sort(),
+      ...(sourceIdFor ? { sourceIds: overlapComponent?.sourceIds?.filter((id) => id.startsWith("public:")) ?? [...sourceIds].sort() } : {}),
+      ...(overlapComponent ? { componentId: overlapComponent.id } : {}),
     });
   };
 

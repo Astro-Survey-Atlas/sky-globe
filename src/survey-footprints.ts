@@ -4,8 +4,6 @@ export type FootprintGeometryQuality = "moc" | "official_overview";
 
 export interface SurveyFootprint {
   surveyId: string;
-  /** Runtime layer identity. Public static footprints may omit this field. */
-  layerId?: string;
   /** A footprint belongs to exactly one registered data release. Survey coverage is its release union. */
   releaseId: string;
   product: string;
@@ -14,8 +12,9 @@ export interface SurveyFootprint {
   nside: number;
   pixels: number[];
   quality: FootprintGeometryQuality;
-  sourceUrl: string;
+  sourceUrl?: string;
   sourceId?: string;
+  layerId?: string;
   retrievedAt: string;
   notes: string;
 }
@@ -36,19 +35,21 @@ function assertManifest(value: unknown): asserts value is SurveyFootprintManifes
   }
   const identities = new Set<string>();
   for (const footprint of manifest.footprints) {
-    if (!footprint || !footprint.surveyId?.trim() || !footprint.releaseId?.trim() || !footprint.product?.trim() || !footprint.label?.trim() || !footprint.notes?.trim() || !Array.isArray(footprint.pixels) || footprint.nside !== manifest.nside || !["moc", "official_overview"].includes(footprint.quality) || !Number.isFinite(Date.parse(footprint.retrievedAt))) {
+    if (!footprint || !footprint.surveyId?.trim() || !footprint.releaseId?.trim() || !footprint.product?.trim() || !footprint.label?.trim() || !footprint.notes?.trim() || !Array.isArray(footprint.pixels) || footprint.nside !== manifest.nside || !["moc", "official_overview"].includes(footprint.quality) || !Number.isFinite(Date.parse(footprint.retrievedAt)) || (footprint.modality !== undefined && (typeof footprint.modality !== "string" || !footprint.modality.trim()))) {
       throw new Error("Survey footprint manifest contains an invalid footprint");
     }
     try {
-      const sourceUrl = new URL(footprint.sourceUrl);
-      if (sourceUrl.protocol !== "https:" && sourceUrl.protocol !== "http:") throw new Error();
+      if (footprint.sourceUrl !== undefined) {
+        const sourceUrl = new URL(footprint.sourceUrl);
+        if (sourceUrl.protocol !== "https:" && sourceUrl.protocol !== "http:") throw new Error();
+      }
     } catch {
       throw new Error(`Survey footprint contains an invalid source URL: ${footprint.surveyId}`);
     }
     const identity = `${footprint.surveyId}:${footprint.releaseId}:${footprint.product}`;
     if (identities.has(identity)) throw new Error(`Survey footprint manifest contains a duplicate identity: ${identity}`);
     identities.add(identity);
-    if (footprint.pixels.some((pixel) => !Number.isInteger(pixel) || pixel < 0 || pixel >= 12 * manifest.nside! ** 2)) {
+    if ((footprint.sourceId !== undefined && (typeof footprint.sourceId !== "string" || !footprint.sourceId.trim())) || (footprint.layerId !== undefined && (typeof footprint.layerId !== "string" || !footprint.layerId.trim())) || footprint.pixels.some((pixel) => !Number.isInteger(pixel) || pixel < 0 || pixel >= 12 * manifest.nside! ** 2)) {
       throw new Error(`Survey footprint contains an invalid HEALPix cell: ${footprint.surveyId}`);
     }
   }

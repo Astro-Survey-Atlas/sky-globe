@@ -13,7 +13,8 @@
   },
   "files": [
     "src",
-    "theme.css"
+    "theme.css",
+    "NOTICE"
   ],
   "dependencies": {
     "healpixjs": "^2.0.0"

@@ -13,4 +13,18 @@ callbacks. Fetching, i18n and page panels stay in each app.
   fails if they drift.
 - `exports` points at TypeScript sources, which Vite, tsx and tsc consume directly.
 
+## Options
+
+`new SurveyLayerViewer(canvas, manifest, surveys, ...callbacks, options?)`. Every
+option defaults to the Assets public-site behaviour:
+
+- `sourceIdForFootprint(footprint)` adds public `sourceIds` to context menus.
+- `overlapContextMenu: true` opens the context menu in overlap mode, scoped to
+  the component under the pointer (`componentId`).
+
+User-asset layers (`setWorkspaceCoverageLayers`) support `preview` layers
+(drawn and inspectable, never offered as available data) and `moc:` keys with
+their own visibility (`setVisibleWorkspaceLayerKeys`). Apps may extend
+`WorkspaceCoverageLayer` with their own fields; the globe ignores them.
+
 License: Apache-2.0.
