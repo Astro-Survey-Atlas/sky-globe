@@ -21,6 +21,9 @@ option defaults to the Assets public-site behaviour:
 - `sourceIdForFootprint(footprint)` adds public `sourceIds` to context menus.
 - `overlapContextMenu: true` opens the context menu in overlap mode, scoped to
   the component under the pointer (`componentId`).
+- `onDrillDown(region)`: double-clicking a cell selects it and reports the
+  region (same payload as the context menu) instead of focusing it. Assets
+  leaves it unset; Workspace uses it to open Aladin.
 
 User-asset layers (`setWorkspaceCoverageLayers`) support `preview` layers
 (drawn and inspectable, never offered as available data) and `moc:` keys with

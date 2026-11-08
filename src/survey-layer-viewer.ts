@@ -114,6 +114,10 @@ export interface SurveyLayerViewerOptions {
   sourceIdForFootprint?: (footprint: SurveyFootprint) => string | null | undefined;
   /** Open the context menu in overlap mode, scoped to the component under the pointer. */
   overlapContextMenu?: boolean;
+  /** Double-click drill-down: when set, double-clicking a cell selects it and
+   * reports the region (same payload as the context menu) instead of
+   * focusing or fanning out the cell. Leave unset to keep the default. */
+  onDrillDown?: (region: SurveyLayerContextMenu) => void;
 }
 
 export interface SurveyLayerOverlapCoverage {
@@ -2852,6 +2856,11 @@ export class SurveyLayerViewer {
     this.#clickTimer = null;
     const hit = this.#pickCell(event);
     if (!hit) return;
+    if (this.#options.onDrillDown && hit.nside === this.#manifest.nside) {
+      this.#clearExplosion(false);
+      this.#options.onDrillDown(this.#regionPayload(event, hit.pixel));
+      return;
+    }
     if (hit.membership && hit.membership.surveyIds.length > 1) {
       this.#presentInspection(hit.nside, hit.pixel, hit.membership, hit.workspaceAvailable, hit.point, true);
       this.#explodeInspection(hit.nside, hit.pixel, hit.membership, true);
@@ -2903,9 +2912,15 @@ export class SurveyLayerViewer {
       this.#onHover(null);
       return;
     }
-    if (!this.#selectedPixels.has(hit.pixel)) {
+    this.#onContextMenu(this.#regionPayload(event, hit.pixel));
+  };
+
+  /** Select `pixel` if it is not already selected, then describe the selected
+   * region (or the overlap component under the pointer). */
+  #regionPayload(event: MouseEvent, pixel: number): SurveyLayerContextMenu {
+    if (!this.#selectedPixels.has(pixel)) {
       this.#selectedPixels.clear();
-      this.#selectedPixels.add(hit.pixel);
+      this.#selectedPixels.add(pixel);
       this.#renderSelectionRegion();
       this.#emitSelection();
     }
@@ -2925,7 +2940,7 @@ export class SurveyLayerViewer {
       workspace.releaseIds.forEach((releaseId) => releaseIds.add(releaseId));
       workspace.assetIds.forEach((assetId) => assetIds.add(assetId));
     }
-    this.#onContextMenu({
+    return {
       clientX: event.clientX,
       clientY: event.clientY,
       nside: overlapComponent ? 2 ** overlapComponent.order : this.#manifest.nside,
@@ -2935,8 +2950,8 @@ export class SurveyLayerViewer {
       assetIds: [...assetIds].sort(),
       ...(sourceIdFor ? { sourceIds: overlapComponent?.sourceIds?.filter((id) => id.startsWith("public:")) ?? [...sourceIds].sort() } : {}),
       ...(overlapComponent ? { componentId: overlapComponent.id } : {}),
-    });
-  };
+    };
+  }
 
   #emitState(): void {
     this.#onStateChange(this.state);
