@@ -9,9 +9,35 @@ callbacks. Fetching, i18n and page panels stay in each app.
 
 - Runtime imports are limited to `three` (peer dependency), `healpixjs` and the
   package's own modules. `test/sky-globe-boundary.test.ts` in Assets enforces it.
-- `sky-depth-types.ts` mirrors the Assets sky-depth wire types; the same test
-  fails if they drift.
+- `sky-depth-types.ts` mirrors the Assets sky-depth wire types; the same Assets
+  test fails if they drift.
 - `exports` points at TypeScript sources, which Vite, tsx and tsc consume directly.
+
+## Install
+
+Pin a release tag; there is no npm publication.
+
+```sh
+npm install "github:Astro-Survey-Atlas/sky-globe#v0.1.0" three@^0.185.1
+```
+
+```ts
+import { SurveyLayerViewer } from "@astro-survey-atlas/sky-globe";
+import "@astro-survey-atlas/sky-globe/theme.css";
+```
+
+The consumer must compile TypeScript (Vite, tsx or tsc with
+`moduleResolution: "Bundler"`).
+
+## Development
+
+```sh
+npm ci
+npm run check   # tsc + node:test
+```
+
+Changes that alter API or appearance get a new minor tag; Assets and Workspace
+upgrade together.
 
 ## Options
 

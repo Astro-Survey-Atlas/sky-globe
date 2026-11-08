@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "three.js HEALPix coverage globe shared by Astro Survey Atlas Assets and Workspace",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Astro-Survey-Atlas/sky-globe.git"
+  },
   "type": "module",
   "sideEffects": [
     "*.css"
@@ -14,12 +18,29 @@
   "files": [
     "src",
     "theme.css",
-    "NOTICE"
+    "NOTICE",
+    "LICENSE",
+    "README.md"
   ],
   "dependencies": {
     "healpixjs": "^2.0.0"
   },
   "peerDependencies": {
     "three": ">=0.185.0 <0.186.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/three": "^0.185.4",
+    "three": "^0.185.1",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }
