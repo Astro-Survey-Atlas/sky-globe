@@ -56,4 +56,13 @@ User-asset layers (`setWorkspaceCoverageLayers`) support `preview` layers
 their own visibility (`setVisibleWorkspaceLayerKeys`). Apps may extend
 `WorkspaceCoverageLayer` with their own fields; the globe ignores them.
 
+## Selection anchor
+
+`state.selectionAnchor` is the screen position and bounds an app uses to attach a
+target callout. It follows the selected cells; when none is selected in overlap
+mode it follows the active overlap component (`setActiveOverlapComponent`), so
+a focused region can carry the same callout as a single cell. It is `null`
+when neither exists. Apps that draw a callout should keep gating it on their own
+selection state (for example `selectedCellCount`) if they want cells only.
+
 License: Apache-2.0.

@@ -331,6 +331,8 @@ interface CameraPose {
 const BASE_COLOR = new THREE.Color("#2c3792");
 // Overlap and selection colours follow the active scene theme.
 const OVERLAP_COLOR = new THREE.Color("#ff8fb0");
+/** Cells sampled to bound an overlap component's on-screen outline. */
+const OVERLAP_ANCHOR_SAMPLE_CELLS = 600;
 const SELECTION_COLOR = new THREE.Color("#f01951");
 const SELECTION_EDGE_COLOR = new THREE.Color("#f6f6ff");
 // Additive blending turns the dark sky into a light table; paper uses normal.
@@ -691,6 +693,7 @@ export class SurveyLayerViewer {
   #overlapPixelSet = new Set<number>();
   #overlapComponents: SurveyLayerOverlapComponent[] = [];
   #activeOverlapComponentId: string | null = null;
+  #overlapAnchorCache: { key: string; center: THREE.Vector3; boundary: THREE.Vector3[] } | null = null;
   #activeOverlapHighlight: OverlapHighlight | null = null;
   #viewportRightInset = 0;
   #disposed = false;
@@ -2413,16 +2416,35 @@ export class SurveyLayerViewer {
     this.#requestRender();
   }
 
+  /** Direction and sampled outline of the active overlap component; cached because the anchor is read every frame. */
+  #overlapAnchorGeometry(): { center: THREE.Vector3; boundary: THREE.Vector3[] } | null {
+    if (!this.#overlapMode || !this.#activeOverlapComponentId) return null;
+    const component = this.#overlapComponents.find((entry) => entry.id === this.#activeOverlapComponentId);
+    if (!component?.cells.length) return null;
+    const key = `${component.id}:${component.order}:${component.cells.length}:${component.cells[0]}:${component.cells[component.cells.length - 1]}`;
+    if (this.#overlapAnchorCache?.key === key) return this.#overlapAnchorCache;
+    const nside = 2 ** component.order;
+    const center = this.#pixelDirectionAt(nside, component.cells);
+    // Bounds only need the outline's extent, so a bounded sample of cells is enough.
+    const stride = Math.max(1, Math.ceil(component.cells.length / OVERLAP_ANCHOR_SAMPLE_CELLS));
+    const boundary = component.cells.filter((_, index) => index % stride === 0)
+      .flatMap((pixel) => sphericalCellBoundary(nside, pixel, 1));
+    this.#overlapAnchorCache = { key, center, boundary };
+    return this.#overlapAnchorCache;
+  }
+
   #selectionAnchor(): SurveyLayerState["selectionAnchor"] {
-    if (!this.#selectedPixels.size) return null;
+    // A selected cell wins; otherwise the active overlap component is the target.
+    const overlap = this.#selectedPixels.size ? null : this.#overlapAnchorGeometry();
+    if (!this.#selectedPixels.size && !overlap) return null;
     // Anchor on the sky surface itself; exploded fragments rise above it.
     const surfaceRadius = this.#outerRadius + .014;
-    const radius = surfaceRadius + (this.#selectionBox?.height ?? 0);
-    const world = this.#pixelDirection(this.#selectedPixels).multiplyScalar(radius);
+    const radius = surfaceRadius + (overlap ? 0 : this.#selectionBox?.height ?? 0);
+    const world = (overlap ? overlap.center.clone() : this.#pixelDirection(this.#selectedPixels)).multiplyScalar(radius);
     const projected = world.clone().project(this.#camera);
     const forward = new THREE.Vector3();
     this.#camera.getWorldDirection(forward);
-    const boundaryDirections = [...this.#selectedPixels]
+    const boundaryDirections = overlap ? overlap.boundary : [...this.#selectedPixels]
       .flatMap((pixel) => sphericalCellBoundary(this.#manifest.nside, pixel, 1));
     const projectedBounds = [Math.max(0.05, surfaceRadius - 0.02), radius]
       .flatMap((sampleRadius) => boundaryDirections.map((point) => point.clone().multiplyScalar(sampleRadius).project(this.#camera)));
