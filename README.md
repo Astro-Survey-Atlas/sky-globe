@@ -47,6 +47,10 @@ option defaults to the Assets public-site behaviour:
 - `sourceIdForFootprint(footprint)` adds public `sourceIds` to context menus.
 - `overlapContextMenu: true` opens the context menu in overlap mode, scoped to
   the component under the pointer (`componentId`).
+- `onOverlapHover(hover)` receives `{ component, clientX, clientY }` or `null`
+  for whole-component tooltips when component picking is enabled (see below).
+  `component` is a `SurveyLayerOverlapComponent`, with its actual order, cells
+  and any supplied source/area metadata; the app owns tooltip content.
 - `onDrillDown(region)`: double-clicking a cell selects it and reports the
   region (same payload as the context menu) instead of focusing it. Assets
   leaves it unset; Workspace uses it to open Aladin.
@@ -56,13 +60,39 @@ User-asset layers (`setWorkspaceCoverageLayers`) support `preview` layers
 their own visibility (`setVisibleWorkspaceLayerKeys`). Apps may extend
 `WorkspaceCoverageLayer` with their own fields; the globe ignores them.
 
+## Overlap component picking (opt in)
+
+`viewer.setOverlapPickingMode("cell" | "component")` defaults to `"cell"`:
+existing overlap label clicks and single-cell inspection remain unchanged.
+It is independent of `setInteractionMode("inspect" | "region")`.
+
+In `"component"` mode, while `setOverlapMode(true)` is active:
+
+- Left-clicking a label or a component's body invokes the existing constructor
+  `onOverlapComponent(component)` callback. Only supplied overlap components
+  can be picked, using NESTED membership at each component's actual order;
+  no cell, depth or object selection/inspection runs. Empty sky does nothing.
+- `options.onOverlapHover` reports the component under the pointer, including
+  coordinates for positioning the app's tooltip. It clears on leaving/cancel,
+  camera interaction/drag, mode changes, coverage rebuilds and disposal. Hover
+  is suppressed while dragging; no synthetic cell hover is emitted.
+- Entering component picking clears stale cell selection, inspection and hover
+  without focusing or moving the camera. The active component set through
+  `setActiveOverlapComponent(id)` owns `state.selectionAnchor`. Clicking reports
+  a target; the app still decides whether to activate or focus it.
+
+The exported `overlapComponentAtPixel(components, order, pixel)` helper returns
+an exact-order member or `null`; it never projects parent/descendant cells.
+`SurveyLayerOverlapPickingMode` and `SurveyLayerOverlapHover` are exported types.
+
 ## Selection anchor
 
 `state.selectionAnchor` is the screen position and bounds an app uses to attach a
-target callout. It follows the selected cells; when none is selected in overlap
-mode it follows the active overlap component (`setActiveOverlapComponent`), so
-a focused region can carry the same callout as a single cell. It is `null`
-when neither exists. Apps that draw a callout should keep gating it on their own
+target callout. By default it follows selected cells; when none is selected in
+overlap mode it follows the active overlap component (`setActiveOverlapComponent`).
+Component picking instead gives that active component sole ownership of the
+anchor, regardless of programmatic cell selections; without an active component
+its anchor is `null`. Apps that draw a callout should keep gating it on their own
 selection state (for example `selectedCellCount`) if they want cells only.
 
 License: Apache-2.0.
