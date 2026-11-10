@@ -19,7 +19,9 @@ import {
   type SurveyLayerModel,
 } from "./survey-layer-model.js";
 import type { SurveyFootprint, SurveyFootprintManifest } from "./survey-footprints.js";
-import { cartesianToRaDec, raDecToCartesian } from "./coordinates.js";
+import { cartesianToRaDec, raDecToCartesian, type EquatorialCoordinate } from "./coordinates.js";
+import { rectangleFromDrag, rectangleNavigationEnabled, rectangleOutlinePositions, unwrapRectangleRa, validateSkyRectangle, type SkyRectangle, type SkyRectangleChangePhase } from "./sky-rectangle.js";
+export type { SkyRectangle, SkyRectangleChangePhase } from "./sky-rectangle.js";
 import { SkyDepthLayer, type SkyDepthAggregate, type SkyDepthLayout } from "./sky-depth-layer.js";
 import type { SkyDepthResponse } from "./sky-depth-types.js";
 import { LAYER_RADIUS_MAX, LAYER_RADIUS_MIN, normalizeLayerOrder, visibleLayerDepths, type LayerDepth } from "./layer-order.js";
@@ -139,6 +141,10 @@ export interface SurveyLayerViewerOptions {
    * reports the region (same payload as the context menu) instead of
    * focusing or fanning out the cell. Leave unset to keep the default. */
   onDrillDown?: (region: SurveyLayerContextMenu) => void;
+  /** Opt-in rectangle interaction only. Drafts may be null while degenerate;
+   * cancel reports the restored committed rectangle. Commit/cancel exit drawing.
+   * Programmatic setRectangleSelection does not emit this callback. */
+  onRectangleChange?: (rectangle: SkyRectangle | null, phase: SkyRectangleChangePhase) => void;
 }
 
 export interface SurveyLayerOverlapCoverage {
@@ -654,6 +660,14 @@ export class SurveyLayerViewer {
   readonly #workspaceCoverageGroup = new THREE.Group();
   readonly #retiredGroup = new THREE.Group();
   readonly #selectionGroup = new THREE.Group();
+  readonly #rectangleGroup = new THREE.Group();
+  #rectangleOutlineKey = "";
+  #rectangleDrawing = false;
+  #rectangleSelection: SkyRectangle | null = null;
+  #rectangleDraft: SkyRectangle | null = null;
+  #rectanglePointer: { id: number; start: EquatorialCoordinate; unwrappedRa: number } | null = null;
+  readonly #navigationPointers = new Set<number>();
+  #rectangleDoubleClickUntil = 0;
   readonly #explosionGroup = new THREE.Group();
   readonly #overlapLabelGroup = new THREE.Group();
   #selectionBox: { height: number } | null = null;
@@ -781,7 +795,7 @@ export class SurveyLayerViewer {
     this.#hudBackdrop = buildHudBackdrop(this.#lineResolution, this.#palette);
     this.#hudOutlineGroup.name = "hud-outlines";
     this.#scene.add(this.#hudBackdrop.group, this.#hudOutlineGroup);
-    this.#scene.add(this.#starField, this.#coverageGroup, this.#workspaceCoverageGroup, this.#drillGroup, this.#objectPointGroup, this.#retiredGroup, this.#selectionGroup, this.#explosionGroup, this.#overlapSelectionGroup, this.#overlapLabelGroup, this.#skyDepth.group);
+    this.#scene.add(this.#starField, this.#coverageGroup, this.#workspaceCoverageGroup, this.#drillGroup, this.#objectPointGroup, this.#retiredGroup, this.#selectionGroup, this.#rectangleGroup, this.#explosionGroup, this.#overlapSelectionGroup, this.#overlapLabelGroup, this.#skyDepth.group);
     this.setTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
     this.#canvas.addEventListener("pointerdown", this.#handlePointerDown);
     this.#canvas.addEventListener("pointerup", this.#handlePointerUp);
@@ -790,6 +804,10 @@ export class SurveyLayerViewer {
     this.#canvas.addEventListener("pointermove", this.#handlePointerMove);
     this.#canvas.addEventListener("pointerleave", this.#handlePointerLeave);
     this.#canvas.addEventListener("pointercancel", this.#handlePointerCancel);
+    this.#canvas.addEventListener("lostpointercapture", this.#handleLostPointerCapture);
+    window.addEventListener("keydown", this.#handleRectangleKeyDown, true);
+    window.addEventListener("blur", this.#handleRectangleBlur);
+    this.#rectangleGroup.name = "sky-rectangle";
     this.#resizeObserver = new ResizeObserver(() => this.#resize());
     this.#resizeObserver.observe(canvas.parentElement ?? canvas);
     this.focusData();
@@ -840,6 +858,7 @@ export class SurveyLayerViewer {
   }
 
   restoreCameraPose(pose: SurveyLayerCameraPose): void {
+    this.setRectangleDrawing(false);
     this.#clearOverlapHover();
     this.#camera.position.set(...pose.position);
     this.#controls.target.set(...pose.target);
@@ -1385,6 +1404,7 @@ export class SurveyLayerViewer {
 
   setOverlapMode(active: boolean): void {
     if (this.#overlapMode === active) return;
+    this.setRectangleDrawing(false);
     if (active && this.#clickTimer) {
       clearTimeout(this.#clickTimer);
       this.#clickTimer = null;
@@ -1413,6 +1433,7 @@ export class SurveyLayerViewer {
    * Does not focus, move the camera, or change the inspect/region interaction mode. */
   setOverlapPickingMode(mode: SurveyLayerOverlapPickingMode): void {
     if (this.#disposed || this.#overlapPickingMode === mode) return;
+    this.setRectangleDrawing(false);
     this.#overlapPickingMode = mode;
     this.#clearOverlapHover();
     if (mode === "component") this.#clearCellPickingState();
@@ -1578,12 +1599,136 @@ export class SurveyLayerViewer {
 
   setLayoutMode(mode: SurveyLayerLayoutMode): void {
     if (this.#layoutMode === mode) return;
+    this.setRectangleDrawing(false);
     this.#layoutMode = mode;
     this.#rebuildVisible(true);
   }
 
+  /** Opt-in RA/Dec drag selection. Commit or any cancellation automatically
+   * restores navigation and leaves this mode. Existing cell selections persist. */
+  setRectangleDrawing(enabled: boolean): void {
+    if (this.#disposed || this.#rectangleDrawing === enabled) return;
+    if (!enabled) {
+      this.#finishRectangle(false);
+      return;
+    }
+    this.#rectangleDrawing = true;
+    this.#cameraTransition = null;
+    this.#controls.enabled = false;
+    // End any pre-existing OrbitControls gesture using its normal cancel path.
+    // This also clears its tracked pointers/capture without private internals.
+    for (const pointerId of this.#navigationPointers) {
+      this.#canvas.dispatchEvent(new PointerEvent("pointercancel", { pointerId }));
+    }
+    this.#navigationPointers.clear();
+    this.#stopOrbitInertia();
+    if (this.#interactionQualityActive) this.#handleControlsEnd();
+    this.#pointerStart = null;
+    if (this.#clickTimer) clearTimeout(this.#clickTimer);
+    this.#clickTimer = null;
+    this.#clearOverlapHover();
+    this.#onHover(null);
+    this.#onInspection(null);
+    this.#canvas.dataset.rectangleDrawing = "true";
+    this.#requestRender();
+  }
+
+  /** Set a numeric outline only; no callback or coverage selection is emitted.
+   * Cancels/disarms any current drag silently. Invalid bounds throw RangeError. */
+  setRectangleSelection(rectangle: SkyRectangle | null): void {
+    if (this.#disposed) return;
+    const validated = rectangle === null ? null : validateSkyRectangle(rectangle);
+    if (this.#rectangleDrawing) this.#finishRectangle(false, false);
+    this.#rectangleSelection = validated;
+    this.#syncRectangleOutline();
+    this.#requestRender();
+  }
+
+  #stopOrbitInertia(): void {
+    // One undamped update consumes pending deltas. Restore the exact pose before
+    // synchronizing again, so stopping inertia neither jumps nor replays it later.
+    const position = this.#camera.position.clone();
+    const target = this.#controls.target.clone();
+    const damping = this.#controls.enableDamping;
+    const autoRotate = this.#controls.autoRotate;
+    this.#controls.removeEventListener("change", this.#handleControlsChange);
+    try {
+      this.#controls.enableDamping = false;
+      this.#controls.autoRotate = false;
+      this.#controls.update();
+      this.#camera.position.copy(position);
+      this.#controls.target.copy(target);
+      this.#controls.update();
+    } finally {
+      this.#controls.enableDamping = damping;
+      this.#controls.autoRotate = autoRotate;
+      this.#controls.addEventListener("change", this.#handleControlsChange);
+    }
+  }
+
+  #finishRectangle(commit: boolean, notify = true): void {
+    const pointer = this.#rectanglePointer;
+    if (commit && this.#rectangleDraft) this.#rectangleSelection = { ...this.#rectangleDraft };
+    this.#rectanglePointer = null;
+    this.#rectangleDraft = null;
+    this.#rectangleDrawing = false;
+    this.#pointerStart = null;
+    delete this.#canvas.dataset.rectangleDrawing;
+    // Invalidate before releasing: lostpointercapture can run synchronously.
+    if (pointer && this.#canvas.hasPointerCapture(pointer.id)) this.#canvas.releasePointerCapture(pointer.id);
+    this.#controls.enabled = rectangleNavigationEnabled(this.#homeScrollProgress, this.#cameraTransition !== null, false);
+    this.#rectangleDoubleClickUntil = performance.now() + 400;
+    this.#syncRectangleOutline();
+    this.#requestRender();
+    if (notify) this.#options.onRectangleChange?.(this.#rectangleSelection ? { ...this.#rectangleSelection } : null, commit ? "commit" : "cancel");
+  }
+
+  #rectanglePoint(event: PointerCoordinates): EquatorialCoordinate | null {
+    const bounds = this.#canvas.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0
+      || event.clientX < bounds.left || event.clientX > bounds.left + bounds.width
+      || event.clientY < bounds.top || event.clientY > bounds.top + bounds.height) return null;
+    this.#pointer.set(((event.clientX - bounds.left) / bounds.width) * 2 - 1, -((event.clientY - bounds.top) / bounds.height) * 2 + 1);
+    this.#camera.updateMatrixWorld(true);
+    this.#raycaster.setFromCamera(this.#pointer, this.#camera);
+    const point = this.#intersectUnitSphere(this.#raycaster.ray);
+    return point ? cartesianToRaDec(point) : null;
+  }
+
+  #updateRectangleDraft(event: PointerCoordinates): boolean {
+    const pointer = this.#rectanglePointer;
+    if (!pointer) return false;
+    const point = this.#rectanglePoint(event);
+    if (point) {
+      pointer.unwrappedRa = unwrapRectangleRa(pointer.unwrappedRa, point.raDeg);
+      this.#rectangleDraft = rectangleFromDrag(pointer.start, pointer.unwrappedRa, point.decDeg);
+    } else this.#rectangleDraft = null;
+    this.#syncRectangleOutline();
+    this.#requestRender();
+    this.#options.onRectangleChange?.(this.#rectangleDraft ? { ...this.#rectangleDraft } : null, "draft");
+    return point !== null && this.#rectangleDraft !== null;
+  }
+
+  #syncRectangleOutline(): void {
+    const rectangle = this.#rectanglePointer ? this.#rectangleDraft : this.#rectangleSelection;
+    const camera = this.#camera.position;
+    const key = JSON.stringify([rectangle, camera.x, camera.y, camera.z, this.#theme]);
+    if (key === this.#rectangleOutlineKey) return;
+    this.#rectangleOutlineKey = key;
+    clearGroup(this.#rectangleGroup);
+    if (!rectangle) return;
+    const positions = rectangleOutlinePositions(rectangle, camera);
+    if (!positions.length) return;
+    // Neutral ink matches HUD text in both themes, independent of survey colour.
+    // Explicit unit-sphere horizon clipping prevents any back-side bleed even
+    // when the opaque backdrop is scaled beneath a separated survey shell.
+    this.#rectangleGroup.add(fatLines(positions, this.#palette.selectionEdge, 2, 0.95, this.#lineResolution,
+      { depthTest: false, renderOrder: SELECTION_RENDER_ORDER + 4 }));
+  }
+
   setInteractionMode(mode: SurveyLayerInteractionMode): void {
     if (this.#interactionMode === mode) return;
+    this.setRectangleDrawing(false);
     this.#clearOverlapHover();
     this.#interactionMode = mode;
     this.#clearExplosion(false);
@@ -1612,11 +1757,15 @@ export class SurveyLayerViewer {
   }
 
   reset(): void {
+    this.setRectangleDrawing(false);
+    this.setRectangleSelection(null);
     this.#cameraTransition = null;
     this.focusData();
   }
 
   clearTransientState(): void {
+    this.setRectangleDrawing(false);
+    this.setRectangleSelection(null);
     this.#clearOverlapHover();
     this.#cameraTransition = null;
     this.#pointerStart = null;
@@ -1642,6 +1791,7 @@ export class SurveyLayerViewer {
   }
 
   focusData(): void {
+    this.setRectangleDrawing(false);
     this.#clearOverlapHover();
     this.#cameraTransition = null;
     this.#homeScrollProgress = 1;
@@ -1681,6 +1831,7 @@ export class SurveyLayerViewer {
   }
 
   setHomePresentation(): void {
+    this.setRectangleDrawing(false);
     this.#cameraTransition = null;
     this.#homeScrollProgress = 0;
     this.#viewShiftWeight = 1;
@@ -1691,6 +1842,7 @@ export class SurveyLayerViewer {
   }
 
   setHomeScrollProgress(progress: number): void {
+    this.setRectangleDrawing(false);
     this.#homeScrollProgress = THREE.MathUtils.clamp(progress, 0, 1);
     this.#cameraTransition = null;
     this.#applyHomeScrollPose();
@@ -1772,12 +1924,13 @@ export class SurveyLayerViewer {
     this.#camera.fov = THREE.MathUtils.lerp(HOME_FOV_DEG, 48, progress);
     this.#camera.updateProjectionMatrix();
     this.#camera.up.copy(progress < 0.5 ? cameraUpForDirection(new THREE.Vector3(1.18, 0.78, 1.46).normalize()) : new THREE.Vector3(0, 1, 0));
-    this.#controls.enabled = progress >= 0.999;
+    this.#controls.enabled = rectangleNavigationEnabled(progress, this.#cameraTransition !== null, this.#rectangleDrawing);
     this.#controls.update();
   }
 
   dispose(options: { releaseContext?: boolean } = {}): void {
     if (this.#disposed) return;
+    this.setRectangleDrawing(false);
     this.#disposed = true;
     this.#clearOverlapHover();
     this.#cameraTransition = null;
@@ -1798,6 +1951,9 @@ export class SurveyLayerViewer {
     this.#canvas.removeEventListener("pointermove", this.#handlePointerMove);
     this.#canvas.removeEventListener("pointerleave", this.#handlePointerLeave);
     this.#canvas.removeEventListener("pointercancel", this.#handlePointerCancel);
+    this.#canvas.removeEventListener("lostpointercapture", this.#handleLostPointerCapture);
+    window.removeEventListener("keydown", this.#handleRectangleKeyDown, true);
+    window.removeEventListener("blur", this.#handleRectangleBlur);
     this.#skyDepth.clear();
     disposeObject(this.#scene);
     disposeRenderer(this.#renderer, options.releaseContext !== false);
@@ -2797,6 +2953,7 @@ export class SurveyLayerViewer {
   }
 
   #startCameraTransition(destination: THREE.Vector3, target: THREE.Vector3, durationMs: number, up?: THREE.Vector3, shiftWeight = this.#viewShiftWeight): void {
+    this.setRectangleDrawing(false);
     this.#clearOverlapHover();
     this.#controls.enabled = false;
     if (up) this.#camera.up.copy(up);
@@ -2824,7 +2981,7 @@ export class SurveyLayerViewer {
     this.#keepCameraOutside();
     if (progress < 1) return;
     this.#cameraTransition = null;
-    this.#controls.enabled = true;
+    this.#controls.enabled = !this.#rectangleDrawing;
     this.#controls.update();
     this.#emitState();
   }
@@ -2930,12 +3087,38 @@ export class SurveyLayerViewer {
   }
 
   readonly #handlePointerDown = (event: PointerEvent): void => {
+    if (this.#rectangleDrawing) {
+      if (event.button !== 0 || this.#rectanglePointer) return;
+      const start = this.#rectanglePoint(event);
+      if (!start) return;
+      event.preventDefault();
+      this.#rectanglePointer = { id: event.pointerId, start, unwrappedRa: start.raDeg };
+      this.#rectangleDraft = null;
+      try {
+        this.#canvas.setPointerCapture(event.pointerId);
+      } catch {
+        this.#finishRectangle(false);
+        return;
+      }
+      this.#updateRectangleDraft(event);
+      return;
+    }
+    if (this.#controls.enabled) this.#navigationPointers.add(event.pointerId);
     if (event.button !== 0) return;
     this.#pointerStart = { x: event.clientX, y: event.clientY };
     this.#clearOverlapHover();
   };
 
   readonly #handlePointerUp = (event: PointerEvent): void => {
+    this.#navigationPointers.delete(event.pointerId);
+    if (this.#rectangleDrawing) {
+      if (event.pointerId !== this.#rectanglePointer?.id) return;
+      event.preventDefault();
+      const valid = this.#updateRectangleDraft(event);
+      // The draft callback may synchronously cancel or replace the selection.
+      if (this.#rectangleDrawing) this.#finishRectangle(valid);
+      return;
+    }
     if (event.button !== 0) return;
     if (!this.#pointerStart) return;
     const distance = Math.hypot(event.clientX - this.#pointerStart.x, event.clientY - this.#pointerStart.y);
@@ -2992,6 +3175,7 @@ export class SurveyLayerViewer {
   };
 
   readonly #handleDoubleClick = (event: MouseEvent): void => {
+    if (this.#rectangleDrawing || performance.now() < this.#rectangleDoubleClickUntil) return;
     if (event.button !== 0) return;
     if (this.#skyDepth.pick(event.clientX, event.clientY, this.#camera, this.#canvas.getBoundingClientRect())) return;
     if (this.#overlapMode) return;
@@ -3013,6 +3197,13 @@ export class SurveyLayerViewer {
   };
 
   readonly #handlePointerMove = (event: PointerEvent): void => {
+    if (this.#rectangleDrawing) {
+      if (event.pointerId === this.#rectanglePointer?.id) {
+        event.preventDefault();
+        this.#updateRectangleDraft(event);
+      }
+      return;
+    }
     if (this.#overlapMode) {
       this.#onHover(null);
       if (this.#overlapPickingMode === "component") {
@@ -3060,12 +3251,28 @@ export class SurveyLayerViewer {
     this.#onHover(null);
     this.#clearOverlapHover();
   };
-  readonly #handlePointerCancel = (): void => {
+  readonly #handlePointerCancel = (event: PointerEvent): void => {
+    this.#navigationPointers.delete(event.pointerId);
+    if (this.#rectangleDrawing && event.pointerId === this.#rectanglePointer?.id) this.#finishRectangle(false);
     this.#pointerStart = null;
     this.#clearOverlapHover();
   };
+  readonly #handleLostPointerCapture = (event: PointerEvent): void => {
+    this.#navigationPointers.delete(event.pointerId);
+    if (this.#rectangleDrawing && event.pointerId === this.#rectanglePointer?.id) this.#finishRectangle(false);
+  };
+  readonly #handleRectangleKeyDown = (event: KeyboardEvent): void => {
+    if (!this.#rectangleDrawing || event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    this.#finishRectangle(false);
+  };
+  readonly #handleRectangleBlur = (): void => {
+    if (this.#rectangleDrawing) this.#finishRectangle(false);
+  };
   readonly #handleContextMenu = (event: MouseEvent): void => {
     event.preventDefault();
+    if (this.#rectangleDrawing) return;
     if (this.#overlapMode && !this.#options.overlapContextMenu) return;
     if (this.#overlapMode && this.#overlapPickingMode === "component") {
       const component = this.#pickOverlapComponent(event);
@@ -3212,6 +3419,7 @@ export class SurveyLayerViewer {
       this.#keepCameraOutside();
       this.#syncTacticalProjection();
       this.#syncCellDetail();
+      this.#syncRectangleOutline();
       this.#composer.render();
       if (moving || this.#cameraTransition || this.#fragmentTransitions.length || this.#explosionTransition || this.#selectionGlowMaterial) this.#requestRender();
     });

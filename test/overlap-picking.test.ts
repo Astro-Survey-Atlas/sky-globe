@@ -5,6 +5,8 @@ import * as THREE from "three";
 
 import { healpixPixelFromSceneDirection, sphericalCellCenter } from "../src/spherical-cell-geometry.js";
 import { SkyDepthLayer } from "../src/sky-depth-layer.js";
+import { raDecToCartesian } from "../src/coordinates.js";
+import type { SkyRectangle, SkyRectangleChangePhase } from "../src/sky-rectangle.js";
 import type { SurveyFootprintManifest } from "../src/survey-footprints.js";
 import type { SurveyLayerContextMenu, SurveyLayerOverlapComponent, SurveyLayerOverlapHover, SurveyLayerViewerOptions } from "../src/survey-layer-viewer.js";
 
@@ -15,9 +17,19 @@ const threeUrl = import.meta.resolve("three");
 const hudUrl = new URL("../src/hud-scene.ts", import.meta.url).href;
 const controlsUrl = moduleUrl(`
   import { EventDispatcher, Vector3 } from ${JSON.stringify(threeUrl)};
+  import { OrbitControls as RealOrbitControls } from ${JSON.stringify(import.meta.resolve("three/addons/controls/OrbitControls.js"))};
   export class OrbitControls extends EventDispatcher {
     target = new Vector3(); enabled = true;
-    constructor(camera) { super(); this.camera = camera; globalThis.__overlapTestControls = this; }
+    constructor(camera, canvas) {
+      super();
+      if (globalThis.__rectangleTestRealControls) {
+        const controls = new RealOrbitControls(camera, canvas);
+        controls.camera = camera;
+        globalThis.__overlapTestControls = controls;
+        return controls;
+      }
+      this.camera = camera; globalThis.__overlapTestControls = this;
+    }
     update() { this.camera.lookAt(this.target); this.camera.updateMatrixWorld(true); return false; }
     dispose() {}
   }
@@ -88,18 +100,30 @@ test("exact-order membership preserves identity and metadata, never projects cel
 
 class TestCanvas extends EventTarget {
   dataset: Record<string, string> = {};
+  style: Record<string, string> = {};
+  ownerDocument = new EventTarget();
+  getRootNode() { return this.ownerDocument; }
   width = 800;
   height = 600;
   clientWidth = 800;
   clientHeight = 600;
   parentElement = null;
+  captured = new Set<number>();
+  setPointerCapture(id: number) { this.captured.add(id); }
+  hasPointerCapture(id: number) { return this.captured.has(id); }
+  releasePointerCapture(id: number) {
+    if (!this.captured.delete(id)) return;
+    const event = new Event("lostpointercapture");
+    Object.assign(event, { pointerId: id });
+    this.dispatchEvent(event);
+  }
   getBoundingClientRect() { return { left: 0, top: 0, width: this.width, height: this.height }; }
   getContext() {
     return new Proxy({}, { get: (_target, key) => key === "measureText" ? () => ({ width: 20 }) : () => undefined });
   }
 }
 
-function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explicitOverlap = true) {
+function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explicitOverlap = true, realControls = false) {
   const restoreGlobals: Array<() => void> = [];
   const globalStub = (name: string, value: unknown) => {
     const old = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -107,7 +131,11 @@ function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explici
     restoreGlobals.push(() => { if (old) Object.defineProperty(globalThis, name, old); else Reflect.deleteProperty(globalThis, name); });
   };
   globalStub("document", { documentElement: { dataset: { theme: "dark" } }, createElement: () => new TestCanvas() });
-  globalStub("window", { innerWidth: 800, innerHeight: 600, devicePixelRatio: 1 });
+  globalStub("window", Object.assign(new EventTarget(), { innerWidth: 800, innerHeight: 600, devicePixelRatio: 1 }));
+  globalStub("PointerEvent", class extends Event {
+    pointerId: number;
+    constructor(type: string, init: PointerEventInit = {}) { super(type); this.pointerId = init.pointerId ?? 0; }
+  });
   globalStub("ResizeObserver", class { observe() {} disconnect() {} });
   let nextFrame: FrameRequestCallback | null = null;
   globalStub("requestAnimationFrame", (callback: FrameRequestCallback) => { nextFrame = callback; return 1; });
@@ -120,6 +148,7 @@ function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explici
   };
   globalStub("Path2D", class { moveTo() {} lineTo() {} closePath() {} });
   globalStub("__overlapTestControls", null);
+  globalStub("__rectangleTestRealControls", realControls);
   globalStub("__overlapTestScene", null);
   const canvas = new TestCanvas();
   const picks: SurveyLayerOverlapComponent[] = [];
@@ -143,7 +172,7 @@ function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explici
     value => menus.push(value), () => undefined, value => objectPicks.push(value), value => picks.push(value),
     { ...options, onOverlapHover: value => hovers.push(value) },
   );
-  const controls = (globalThis as unknown as { __overlapTestControls: THREE.EventDispatcher<{ start: {}; end: {}; change: {} }> & { camera: THREE.PerspectiveCamera; update(): boolean } }).__overlapTestControls;
+  const controls = (globalThis as unknown as { __overlapTestControls: THREE.EventDispatcher<{ start: {}; end: {}; change: {} }> & { camera: THREE.PerspectiveCamera; enabled: boolean; enableDamping: boolean; autoRotate: boolean; target: THREE.Vector3; update(): boolean } }).__overlapTestControls;
   t.after(() => { viewer.dispose({ releaseContext: false }); restoreGlobals.reverse().forEach(restore => restore()); });
   viewer.setVisibleSurveys(["s", "t"]);
   const component: SurveyLayerOverlapComponent = { id: "C01", order: 4, cells: [100, 101], sourceIds: ["public:fixture"], areaDeg2: 2 };
@@ -161,8 +190,9 @@ function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explici
   };
   const pointer = (type: string, x = pointerX, y = pointerY, extras: Record<string, unknown> = {}) => {
     const event = new Event(type);
-    Object.assign(event, { button: 0, buttons: type === "pointerdown" ? 1 : 0, clientX: x, clientY: y, ctrlKey: false, metaKey: false, ...extras });
+    Object.assign(event, { pointerId: 1, pointerType: "mouse", button: 0, buttons: type === "pointerdown" ? 1 : 0, clientX: x, clientY: y, ctrlKey: false, metaKey: false, ...extras });
     canvas.dispatchEvent(event);
+    if (realControls && (type === "pointermove" || type === "pointerup")) canvas.ownerDocument.dispatchEvent(event);
   };
   const click = (x = pointerX, y = pointerY, extras: Record<string, unknown> = {}) => { pointer("pointerdown", x, y, extras); pointer("pointerup", x, y, extras); };
   const coordinates = () => ({ clientX: pointerX, clientY: pointerY });
@@ -564,4 +594,282 @@ viewerTest("default overlap cell inspection and inspect/region API remain availa
   assert.equal(f.viewer.state.interactionMode, "inspect");
   f.click();
   assert.deepEqual(f.viewer.state.selectedPixels, [100]);
+});
+
+// Rectangle tests reuse the renderer-only stubs above; rays, coordinates, public
+// API methods and all registered viewer handlers are the actual implementation.
+function rectangleFixture(t: TestContext, realControls = false) {
+  const changes: Array<{ rectangle: SkyRectangle | null; phase: SkyRectangleChangePhase }> = [];
+  const f = fixture(t, { onRectangleChange: (rectangle, phase) => changes.push({ rectangle, phase }) }, true, realControls);
+  const aimRectangle = () => {
+    const position = raDecToCartesian(0, 0, 5);
+    f.viewer.restoreCameraPose({ position: [position.x, position.y, position.z], target: [0, 0, 0], up: [0, 1, 0], fov: 48 });
+    f.viewer.setViewportRightInset(1);
+    f.viewer.setViewportRightInset(0);
+  };
+  const coordinate = (ra: number, dec: number): [number, number] => {
+    const point = raDecToCartesian(ra, dec);
+    const projected = new THREE.Vector3(point.x, point.y, point.z).project(f.controls.camera);
+    return [(projected.x + 1) * 400, (1 - projected.y) * 300];
+  };
+  const at = (type: string, ra: number, dec: number, extra: Record<string, unknown> = {}) => {
+    const [x, y] = coordinate(ra, dec);
+    assert.ok(x >= 0 && x <= 800 && y >= 0 && y <= 600, `${type}: RA ${ra}, Dec ${dec} projected to ${x}, ${y}`);
+    f.pointer(type, x, y, extra);
+  };
+  const outline = () => f.scene().getObjectByName("sky-rectangle")!;
+  aimRectangle();
+  return { ...f, changes, aimRectangle, coordinate, at, outline };
+}
+
+const rectangleNear = (actual: SkyRectangle | null, expected: SkyRectangle) => {
+  assert.ok(actual);
+  for (const key of ["raStart", "raEnd", "decMin", "decMax"] as const) assert.ok(Math.abs(actual[key] - expected[key]) < 1e-7, `${key}: ${actual[key]} vs ${expected[key]}`);
+};
+
+viewerTest("rectangle drawing is opt-in, commits either drag direction across zero, then restores navigation", t => {
+  const f = rectangleFixture(t);
+  assert.equal(f.canvas.dataset.rectangleDrawing, undefined);
+  assert.equal(f.controls.enabled, true);
+  const expected = { raStart: 350, raEnd: 10, decMin: -5, decMax: 5 };
+  for (const [startRa, startDec, endRa, endDec] of [[350, -5, 10, 5], [10, 5, 350, -5]]) {
+    f.viewer.setRectangleDrawing(true);
+    assert.equal(f.controls.enabled, false);
+    f.at("pointerdown", startRa!, startDec!);
+    assert.equal(f.canvas.hasPointerCapture(1), true);
+    f.at("pointermove", 0, 0);
+    f.at("pointermove", endRa!, endDec!);
+    rectangleNear(f.changes.at(-1)!.rectangle, expected);
+    assert.equal(f.changes.at(-1)!.phase, "draft");
+    f.at("pointerup", endRa!, endDec!);
+    assert.equal(f.changes.at(-1)!.phase, "commit");
+    rectangleNear(f.changes.at(-1)!.rectangle, expected);
+    assert.equal(f.canvas.hasPointerCapture(1), false);
+    assert.equal(f.controls.enabled, true);
+    assert.equal(f.canvas.dataset.rectangleDrawing, undefined);
+    assert.equal(f.outline().children.length, 1);
+  }
+  assert.deepEqual(f.picks, []);
+  assert.deepEqual(f.viewer.state.selectedPixels, []);
+});
+
+viewerTest("rectangle rays ignore coverage membership, shell offsets and overlap picking", t => {
+  const f = rectangleFixture(t);
+  const expected = { raStart: 350, raEnd: 10, decMin: -5, decMax: 5 };
+  for (const mode of ["layers", "overlap"] as const) {
+    if (mode === "overlap") {
+      f.viewer.setOverlapMode(true);
+      f.viewer.setOverlapPickingMode("component");
+    }
+    f.aimRectangle();
+    f.viewer.setRectangleDrawing(true);
+    f.at("pointerdown", 350, -5);
+    f.at("pointerup", 10, 5);
+    rectangleNear(f.changes.at(-1)!.rectangle, expected);
+  }
+  assert.deepEqual(f.picks, []);
+  assert.deepEqual(f.objectPicks, []);
+  assert.deepEqual(f.menus, []);
+});
+
+viewerTest("numeric rectangle updates are silent, preserve wide/full RA and reject invalid bounds atomically", t => {
+  const f = rectangleFixture(t);
+  const wide = { raStart: 10, raEnd: 350, decMin: -10, decMax: 10 };
+  f.viewer.setRectangleSelection(wide);
+  assert.equal(f.outline().children.length, 1);
+  assert.deepEqual(f.changes, []);
+  assert.throws(() => f.viewer.setRectangleSelection({ ...wide, decMin: 20 }), RangeError);
+  assert.equal(f.outline().children.length, 1);
+  f.viewer.setRectangleSelection({ ...wide, raStart: 0, raEnd: 360 });
+  assert.equal(f.outline().children.length, 1);
+  f.viewer.setRectangleDrawing(true);
+  f.at("pointerdown", 350, -5);
+  f.changes.length = 0;
+  f.viewer.setRectangleSelection(wide);
+  assert.deepEqual(f.changes, []);
+  assert.equal(f.controls.enabled, true);
+  assert.equal(f.canvas.hasPointerCapture(1), false);
+  f.viewer.setRectangleSelection(null);
+  assert.equal(f.outline().children.length, 0);
+});
+
+viewerTest("invalid or degenerate release cancels instead of inventing coordinates and restores old rectangle", t => {
+  const f = rectangleFixture(t);
+  const committed = { raStart: 345, raEnd: 15, decMin: -10, decMax: 10 };
+  f.viewer.setRectangleSelection(committed);
+  for (const release of ["off-sphere", "outside-canvas", "degenerate"] as const) {
+    f.viewer.setRectangleDrawing(true);
+    f.at("pointerdown", 350, -5);
+    f.at("pointermove", 10, 5);
+    if (release === "degenerate") f.at("pointerup", 350, -5);
+    else f.pointer("pointerup", release === "off-sphere" ? 0 : -100, 0);
+    assert.deepEqual(f.changes.at(-1), { rectangle: committed, phase: "cancel" });
+    assert.equal(f.controls.enabled, true);
+    assert.equal(f.outline().children.length, 1);
+    assert.equal(f.canvas.hasPointerCapture(1), false);
+  }
+});
+
+viewerTest("a second pointer cannot mutate, commit or cancel the active rectangle; leaving and reentering canvas works", t => {
+  const f = rectangleFixture(t);
+  f.viewer.setRectangleDrawing(true);
+  f.at("pointerdown", 350, -5);
+  const count = f.changes.length;
+  for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel", "lostpointercapture"]) f.at(type, 20, 10, { pointerId: 2 });
+  assert.equal(f.changes.length, count);
+  assert.equal(f.canvas.hasPointerCapture(1), true);
+  f.pointer("pointermove", -100, 100);
+  assert.equal(f.changes.at(-1)!.rectangle, null);
+  f.pointer("pointerleave");
+  assert.equal(f.controls.enabled, false);
+  f.at("pointerup", 10, 5);
+  assert.equal(f.changes.at(-1)!.phase, "commit");
+  rectangleNear(f.changes.at(-1)!.rectangle, { raStart: 350, raEnd: 10, decMin: -5, decMax: 5 });
+});
+
+for (const cancel of ["pointercancel", "lostpointercapture", "Escape", "blur", "disable", "interaction", "overlap", "picking", "layout", "reset", "clear", "focus", "dispose"] as const) {
+  viewerTest(`rectangle ${cancel} cancels once, releases capture and restores controls`, t => {
+    const f = rectangleFixture(t);
+    f.viewer.setRectangleSelection({ raStart: 345, raEnd: 15, decMin: -10, decMax: 10 });
+    f.viewer.setRectangleDrawing(true);
+    f.at("pointerdown", 350, -5);
+    f.at("pointermove", 10, 5);
+    f.changes.length = 0;
+    switch (cancel) {
+      case "pointercancel": f.pointer("pointercancel"); break;
+      case "lostpointercapture": f.canvas.releasePointerCapture(1); break;
+      case "Escape": {
+        const event = new Event("keydown", { cancelable: true });
+        Object.assign(event, { key: "Escape" });
+        window.dispatchEvent(event);
+        assert.equal(event.defaultPrevented, true);
+        break;
+      }
+      case "blur": window.dispatchEvent(new Event("blur")); break;
+      case "disable": f.viewer.setRectangleDrawing(false); break;
+      case "interaction": f.viewer.setInteractionMode("region"); break;
+      case "overlap": f.viewer.setOverlapMode(true); break;
+      case "picking": f.viewer.setOverlapPickingMode("component"); break;
+      case "layout": f.viewer.setLayoutMode("overlap"); break;
+      case "reset": f.viewer.reset(); break;
+      case "clear": f.viewer.clearTransientState(); break;
+      case "focus": f.viewer.focusData(); break;
+      case "dispose": f.viewer.dispose({ releaseContext: false }); break;
+    }
+    assert.equal(f.changes.length, 1);
+    assert.equal(f.changes[0]!.phase, "cancel");
+    assert.equal(f.canvas.hasPointerCapture(1), false);
+    assert.equal(f.canvas.dataset.rectangleDrawing, undefined);
+    assert.equal(f.controls.enabled, true);
+    if (cancel === "reset" || cancel === "clear") assert.equal(f.outline().children.length, 0);
+  });
+}
+
+viewerTest("drawing clears pending cell clicks, suppresses inspect/depth/menu/double-click, and leaves ordinary events unswallowed", t => {
+  const f = rectangleFixture(t);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  f.aim(4, 100);
+  f.click(); // Cell action is waiting for the double-click timeout.
+  f.viewer.setRectangleDrawing(true);
+  t.mock.timers.tick(221);
+  assert.deepEqual(f.viewer.state.selectedPixels, []);
+  const fail = () => { throw Error("rectangle mode must bypass other picking"); };
+  t.mock.method(SkyDepthLayer.prototype, "pick", fail);
+  f.pointer("dblclick");
+  f.pointer("contextmenu");
+  f.pointer("pointermove");
+  f.click(); // A degenerate rectangle cancels rather than selecting a cell.
+  f.pointer("dblclick"); // Browser's trailing event must remain suppressed.
+  assert.deepEqual(f.picks, []);
+  assert.deepEqual(f.menus, []);
+  assert.deepEqual(f.objectPicks, []);
+  assert.equal(f.changes.at(-1)!.phase, "cancel");
+  const escape = new Event("keydown", { cancelable: true });
+  Object.assign(escape, { key: "Escape" });
+  window.dispatchEvent(escape);
+  assert.equal(escape.defaultPrevented, false);
+  const ordinary = new Event("pointerdown", { cancelable: true });
+  Object.assign(ordinary, { button: 0, pointerId: 1, clientX: 0, clientY: 0 });
+  f.canvas.dispatchEvent(ordinary);
+  assert.equal(ordinary.defaultPrevented, false);
+});
+
+viewerTest("entering drawing stops transitions and consumes inertia without changing pose or replaying it", t => {
+  const f = rectangleFixture(t);
+  f.viewer.transitionToDataPresentation();
+  assert.equal(f.controls.enabled, false);
+  let pendingInertia = true;
+  const baseUpdate = f.controls.update.bind(f.controls);
+  t.mock.method(f.controls, "update", () => {
+    if (pendingInertia) {
+      f.controls.camera.position.x += 0.1;
+      if (!f.controls.enableDamping) pendingInertia = false;
+    }
+    return baseUpdate();
+  });
+  const pose = f.viewer.cameraPose;
+  f.viewer.setRectangleDrawing(true);
+  assert.deepEqual(f.viewer.cameraPose, pose);
+  assert.equal(pendingInertia, false);
+  f.frame(performance.now() + 5000);
+  assert.deepEqual(f.viewer.cameraPose, pose);
+  assert.equal(f.controls.enabled, false);
+  f.viewer.setRectangleDrawing(false);
+  f.controls.update();
+  assert.deepEqual(f.viewer.cameraPose, pose);
+  assert.equal(f.controls.enabled, true);
+  f.viewer.setHomePresentation();
+  assert.equal(f.controls.enabled, false);
+  f.viewer.setRectangleDrawing(true);
+  f.viewer.setRectangleDrawing(false);
+  assert.equal(f.controls.enabled, false, "home presentation must not accidentally enable navigation");
+});
+
+viewerTest("real OrbitControls ends an active orbit and inertia, draws without rotating, then accepts fresh navigation", t => {
+  const f = rectangleFixture(t, true);
+  f.pointer("pointerdown", 400, 300);
+  f.pointer("pointermove", 440, 320, { buttons: 1 });
+  const pose = f.viewer.cameraPose;
+  const nearPose = (expected: typeof pose) => {
+    const actual = f.viewer.cameraPose;
+    for (const key of ["position", "target", "up"] as const) for (let index = 0; index < 3; index++) {
+      assert.ok(Math.abs(actual[key][index]! - expected[key][index]!) < 1e-12, `${key}[${index}] must not move`);
+    }
+    assert.equal(actual.fov, expected.fov);
+  };
+  f.viewer.setRectangleDrawing(true);
+  nearPose(pose);
+  assert.equal(f.canvas.hasPointerCapture(1), false, "old orbit capture must be released");
+  f.frame();
+  nearPose(pose);
+  f.viewer.setRectangleDrawing(false);
+  for (let iteration = 0; iteration < 4; iteration++) f.controls.update();
+  nearPose(pose);
+  f.aimRectangle();
+  const before = f.viewer.cameraPose;
+  f.viewer.setRectangleDrawing(true);
+  f.at("pointerdown", 350, -5);
+  f.at("pointermove", 0, 0, { buttons: 1 });
+  f.at("pointerup", 10, 5);
+  rectangleNear(f.changes.at(-1)!.rectangle, { raStart: 350, raEnd: 10, decMin: -5, decMax: 5 });
+  assert.equal(f.changes.at(-1)!.phase, "commit");
+  assert.deepEqual(f.viewer.cameraPose, before);
+  f.pointer("pointerdown", 400, 300);
+  f.pointer("pointermove", 440, 320, { buttons: 1 });
+  f.pointer("pointerup", 440, 320);
+  assert.notDeepEqual(f.viewer.cameraPose.position, before.position, "new ordinary orbit must work");
+});
+
+viewerTest("programmatic numeric outlines are horizon-clipped and update when camera moves", t => {
+  const f = rectangleFixture(t);
+  const rectangle = { raStart: 350, raEnd: 10, decMin: -5, decMax: 5 };
+  f.viewer.setRectangleSelection(rectangle);
+  assert.equal(f.outline().children.length, 1);
+  const position = raDecToCartesian(180, 0, 3);
+  f.viewer.restoreCameraPose({ position: [position.x, position.y, position.z], target: [0, 0, 0], up: [0, 1, 0], fov: 48 });
+  f.frame();
+  assert.equal(f.outline().children.length, 0);
+  f.aimRectangle();
+  f.frame();
+  assert.equal(f.outline().children.length, 1);
 });

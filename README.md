@@ -85,6 +85,60 @@ The exported `overlapComponentAtPixel(components, order, pixel)` helper returns
 an exact-order member or `null`; it never projects parent/descendant cells.
 `SurveyLayerOverlapPickingMode` and `SurveyLayerOverlapHover` are exported types.
 
+## RA/Dec rectangles (opt in)
+
+Rectangle drawing is **off by default** and independent of inspect/region and
+cell/component selection. The app owns the draw button, numeric inputs and queries.
+
+```ts
+import type { SkyRectangle, SkyRectangleChangePhase } from "@astro-survey-atlas/sky-globe";
+
+// In the constructor's options argument:
+const options = {
+  onRectangleChange(rectangle: SkyRectangle | null, phase: SkyRectangleChangePhase) {
+    // "draft": update inputs; null means degenerate bounds or off-sphere.
+    // "commit": valid rectangle; drawing has already exited.
+    // "cancel": previous committed rectangle (or null); drawing has exited.
+    // Do not echo drafts into setRectangleSelection: it disarms the drag.
+  },
+};
+
+viewer.setRectangleDrawing(true);  // Explicitly arm a one-pointer drag.
+viewer.setRectangleDrawing(false); // Cancel/disarm, restoring committed bounds.
+viewer.setRectangleSelection({ raStart: 350, raEnd: 10, decMin: -5, decMax: 5 });
+viewer.setRectangleSelection(null); // Clear the outline; no coverage selection.
+```
+
+- `SkyRectangle = { raStart: number; raEnd: number; decMin: number; decMax: number }`
+  uses ICRS degrees. Numeric bounds must have RA in `[0, 360]` and
+  `-90 ≤ decMin < decMax ≤ 90`. Increasing RA from start to end wraps through
+  zero: `350 → 10` is narrow, `10 → 350` is wide, and only `0 → 360` is full RA.
+  Equivalent endpoints otherwise mean zero width and are rejected.
+- `setRectangleSelection(rectangle: SkyRectangle | null): void` validates and
+  copies bounds, silently disarms any active drag, and changes only the outline.
+  It never emits `onRectangleChange`; invalid bounds throw `RangeError` without
+  changing the existing selection. Thus input changes cannot create callback loops.
+- `setRectangleDrawing(enabled: boolean): void` clears pending click actions,
+  freezes camera transition/inertia at the current pose, and disables navigation
+  until commit or cancel. Drag RA unwraps continuously in either direction.
+  Picking intersects the reference **unit sphere**, independent of survey shells,
+  displayed HEALPix order, coverage membership, depth and overlap components.
+- Only the active captured pointer can change the draft. Release off the sphere,
+  a degenerate release, pointer cancellation/lost capture, Escape, window blur,
+  disabling drawing or changing interaction/layout/overlap/camera mode cancels it.
+  Committed bounds survive cancellation of a new draft. `reset()` and
+  `clearTransientState()` clear the rectangle; disposal releases capture/listeners.
+  Commit and cancel both restore controls according to the current presentation.
+- The neutral outline samples constant-Dec parallels and RA meridians, clipped
+  to the visible unit-sphere horizon; it is not a geodesic quadrilateral or a
+  screen rectangle. Full-RA bands have no artificial seam. It communicates bounds,
+  **not** a HEALPix approximation, data precision or coverage availability.
+
+The exported pure helpers `validateSkyRectangle`, `rectangleRaSpan`,
+`unwrapRectangleRa`, `rectangleFromDrag`, `rectangleNavigationEnabled` and
+`rectangleOutlinePositions` are covered by headless tests. Viewer tests reuse real
+rays/handlers with only GPU/DOM infrastructure stubbed.
+
 ## Selection anchor
 
 `state.selectionAnchor` is the screen position and bounds an app uses to attach a

@@ -14,6 +14,7 @@ export * from "./scene-theme.js";
 export * from "./sky-depth-layer.js";
 export type * from "./sky-depth-types.js";
 export * from "./sky-reference.js";
+export * from "./sky-rectangle.js";
 export * from "./spherical-cell-geometry.js";
 export * from "./survey-colors.js";
 export * from "./survey-footprints.js";
