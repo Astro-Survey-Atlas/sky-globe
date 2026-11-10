@@ -123,7 +123,7 @@ class TestCanvas extends EventTarget {
   }
 }
 
-function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explicitOverlap = true, realControls = false) {
+function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explicitOverlap = true, realControls = false, fixtureOptions: { noResizeObserver?: boolean } = {}) {
   const restoreGlobals: Array<() => void> = [];
   const globalStub = (name: string, value: unknown) => {
     const old = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -136,7 +136,13 @@ function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explici
     pointerId: number;
     constructor(type: string, init: PointerEventInit = {}) { super(type); this.pointerId = init.pointerId ?? 0; }
   });
-  globalStub("ResizeObserver", class { observe() {} disconnect() {} });
+  const observers: Array<{ cb: () => void; disconnected: boolean }> = [];
+  globalStub("ResizeObserver", fixtureOptions.noResizeObserver ? undefined : class {
+    entry: { cb: () => void; disconnected: boolean } = { cb: () => undefined, disconnected: false };
+    constructor(cb: () => void) { this.entry.cb = cb; observers.push(this.entry); }
+    observe() {}
+    disconnect() { this.entry.disconnected = true; }
+  });
   let nextFrame: FrameRequestCallback | null = null;
   globalStub("requestAnimationFrame", (callback: FrameRequestCallback) => { nextFrame = callback; return 1; });
   globalStub("cancelAnimationFrame", () => { nextFrame = null; });
@@ -201,7 +207,7 @@ function fixture(t: TestContext, options: SurveyLayerViewerOptions = {}, explici
     const groups = scene().children.filter((object): object is THREE.Group => object instanceof THREE.Group);
     return groups.flatMap(group => group.children).filter(object => object instanceof THREE.Sprite && object.userData.overlapComponent);
   };
-  return { viewer, canvas, controls, manifest, component, picks, hovers, inspections, selections, cellHovers, objectPicks, menus, aim, pointer, click, coordinates, labels, scene, frame };
+  return { observers, viewer, canvas, controls, manifest, component, picks, hovers, inspections, selections, cellHovers, objectPicks, menus, aim, pointer, click, coordinates, labels, scene, frame };
 }
 
 viewerTest("component body clicks bypass depth, objects and cell inspection; empty sky is inert", t => {
@@ -872,4 +878,62 @@ viewerTest("programmatic numeric outlines are horizon-clipped and update when ca
   f.aimRectangle();
   f.frame();
   assert.equal(f.outline().children.length, 1);
+});
+
+function coverageWithCounter(f: ReturnType<typeof fixture>) {
+  let calls = 0;
+  const original = f.canvas.getBoundingClientRect.bind(f.canvas);
+  f.canvas.getBoundingClientRect = () => { calls++; return original(); };
+  f.viewer.restoreCameraPose({ position: [0, 0, 3], target: [0, 0, 0], up: [0, 1, 0], fov: 10 });
+  return { calls: () => calls, radius: () => f.viewer.state.coverageViewRadiusRad };
+}
+
+viewerTest("coverage radius uses a cached canvas width that follows the observer", t => {
+  const f = fixture(t);
+  const c = coverageWithCounter(f);
+  f.viewer.setViewportRightInset(300);
+  const before = c.calls();
+  const first = c.radius();
+  c.radius(); c.radius();
+  assert.equal(c.calls(), before, "state reads must not touch layout");
+  assert.ok(Number.isFinite(first) && first > 0);
+  f.canvas.width = 1200;
+  f.observers.forEach(o => o.cb());
+  const wide = c.radius();
+  f.canvas.width = 800;
+  f.observers.forEach(o => o.cb());
+  assert.equal(c.radius(), first, "same width gives identical result");
+  // Independent copy of the pre-cache formula, using the live rect width.
+  const oldRadius = (width: number, inset: number) => {
+    const camera = f.controls.camera;
+    const distance = camera.position.length();
+    camera.updateMatrixWorld(true);
+    const right = 1 - 2 * Math.min(inset, width) / width;
+    const inward = camera.position.clone().negate().normalize();
+    const off = Math.max(...[[-1, -1], [-1, 1], [right, -1], [right, 1]].map(([x, y]) =>
+      inward.angleTo(new THREE.Vector3(x, y, 0.5).unproject(camera).sub(camera.position).normalize())));
+    const shell = f.viewer.state.outerRadius + 0.003;
+    const apparent = Math.asin(Math.min(1, shell / distance));
+    if (off >= apparent) return Math.min(Math.PI / 2, Math.acos(shell / distance) + 0.003);
+    return Math.min(Math.PI / 2, Math.max(0, Math.asin(Math.min(1, distance / shell * Math.sin(off))) - off) + 0.003);
+  };
+  assert.ok(Math.abs(first - oldRadius(800, 300)) < 1e-9, `cached ${first} vs old ${oldRadius(800, 300)}`);
+  assert.notEqual(wide, first, "a wider canvas changes the inset ratio");
+});
+
+viewerTest("resize observers are disconnected on dispose", t => {
+  const f = fixture(t);
+  assert.ok(f.observers.length > 0);
+  f.viewer.dispose({ releaseContext: false });
+  assert.ok(f.observers.every(o => o.disconnected));
+});
+
+viewerTest("coverage radius works without ResizeObserver and measures lazily once", t => {
+  const f = fixture(t, {}, true, false, { noResizeObserver: true });
+  const c = coverageWithCounter(f);
+  f.viewer.setViewportRightInset(300);
+  const before = c.calls();
+  const a = c.radius();
+  assert.equal(c.radius(), a);
+  assert.equal(c.calls(), before);
 });

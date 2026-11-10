@@ -677,7 +677,7 @@ export class SurveyLayerViewer {
   readonly #skyDepth = new SkyDepthLayer();
   #skyDepthData: SkyDepthResponse | null = null;
   #onSkyDepthPick: ((item: SkyDepthAggregate) => void) | null = null;
-  readonly #resizeObserver: ResizeObserver;
+  readonly #resizeObserver: ResizeObserver | null;
   readonly #onSelection: (selection: SurveyLayerSelection | null) => void;
   readonly #onHover: (hover: SurveyLayerHover | null) => void;
   readonly #onInspection: (inspection: SurveyLayerInspection | null) => void;
@@ -734,6 +734,8 @@ export class SurveyLayerViewer {
   #overlapAnchorCache: { key: string; center: THREE.Vector3; boundary: THREE.Vector3[] } | null = null;
   #activeOverlapHighlight: OverlapHighlight | null = null;
   #viewportRightInset = 0;
+  /** Cached canvas border-box width in CSS px; see #canvasCssWidth. null = not measured yet. */
+  #canvasWidth: number | null = null;
   #disposed = false;
   #renderFrame: number | null = null;
 
@@ -808,8 +810,12 @@ export class SurveyLayerViewer {
     window.addEventListener("keydown", this.#handleRectangleKeyDown, true);
     window.addEventListener("blur", this.#handleRectangleBlur);
     this.#rectangleGroup.name = "sky-rectangle";
-    this.#resizeObserver = new ResizeObserver(() => this.#resize());
-    this.#resizeObserver.observe(canvas.parentElement ?? canvas);
+    this.#resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(() => this.#resize()) : null;
+    this.#resizeObserver?.observe(canvas.parentElement ?? canvas);
+    // Also watch the canvas itself so the cached width cannot go stale when
+    // only the canvas (not its parent) changes size, or when it goes from
+    // display:none to shown.
+    if (canvas.parentElement) this.#resizeObserver?.observe(canvas);
     this.focusData();
     this.#resize();
   }
@@ -1015,7 +1021,8 @@ export class SurveyLayerViewer {
 
   /** Shift the projection so focused sky remains centred beside a right drawer. */
   setViewportRightInset(insetPixels: number): void {
-    const width = Math.max(1, Math.round(this.#canvas.getBoundingClientRect().width));
+    // Not per-frame: always measure fresh and refresh the cache with it.
+    const width = Math.max(1, Math.round(this.#measureCanvasWidth()));
     const next = THREE.MathUtils.clamp(Number.isFinite(insetPixels) ? insetPixels : 0, 0, width * 0.8);
     if (Math.abs(next - this.#viewportRightInset) < 0.5) return;
     this.#viewportRightInset = next;
@@ -1357,6 +1364,33 @@ export class SurveyLayerViewer {
     return Math.max(0.01, Math.min(180, THREE.MathUtils.radToDeg(halfSpan * 2)));
   }
 
+  /**
+   * Canvas width for per-frame math. getBoundingClientRect forces a
+   * synchronous reflow right after the previous frame wrote to the DOM (measured
+   * at ~340 ms per 17 s of dragging), so the width is cached. The cache is
+   * refreshed by #resize (ResizeObserver on the canvas and its parent, which
+   * also covers display:none -> shown and the first layout) and by
+   * setViewportRightInset. Decisions: the value is still the border-box width
+   * from getBoundingClientRect, sampled at resize time, so it matches the old
+   * numbers exactly. A CSS transform scale applied without a size change would
+   * not be noticed until the next resize; neither this package nor the Assets
+   * and Workspace mounts scale the canvas (the only scale() uses there are
+   * unrelated hover/animation effects), and #resize already sizes the renderer
+   * from the same rect. devicePixelRatio is irrelevant (CSS px both ways). The
+   * drawer inset is a separate field read live, so it needs no invalidation.
+   * Without ResizeObserver (tests/Node) or before any callback it measures
+   * lazily once and keeps that value.
+   */
+  #canvasCssWidth(): number {
+    return this.#canvasWidth ?? this.#measureCanvasWidth();
+  }
+
+  #measureCanvasWidth(): number {
+    const width = this.#canvas.getBoundingClientRect().width;
+    this.#canvasWidth = width;
+    return width;
+  }
+
   #coverageViewRadiusRad(camera = this.#camera): number {
     const distance = camera.position.length();
     const radius = this.#outerRadius;
@@ -1365,7 +1399,7 @@ export class SurveyLayerViewer {
     camera.updateMatrixWorld(true);
     // The projection shifts the sky into the pane beside the drawer. Exclude
     // the covered canvas strip when computing the source-loading footprint.
-    const width = Math.max(1, this.#canvas.getBoundingClientRect().width);
+    const width = Math.max(1, this.#canvasCssWidth());
     const right = 1 - 2 * Math.min(this.#viewportRightInset, width) / width;
     const corners = [[-1, -1], [-1, 1], [right, -1], [right, 1]] as const;
     const inward = camera.position.clone().negate().normalize();
@@ -1939,7 +1973,7 @@ export class SurveyLayerViewer {
     this.#renderQueued = false;
     if (this.#clickTimer) clearTimeout(this.#clickTimer);
     this.#clickTimer = null;
-    this.#resizeObserver.disconnect();
+    this.#resizeObserver?.disconnect();
     this.#controls.removeEventListener("change", this.#handleControlsChange);
     this.#controls.removeEventListener("start", this.#handleControlsStart);
     this.#controls.removeEventListener("end", this.#handleControlsEnd);
@@ -3338,6 +3372,7 @@ export class SurveyLayerViewer {
 
   #resize(): void {
     const bounds = this.#canvas.getBoundingClientRect();
+    this.#canvasWidth = bounds.width;
     const width = Math.max(1, Math.round(bounds.width));
     const height = Math.max(1, Math.round(bounds.height));
     this.#renderer.setSize(width, height, false);
